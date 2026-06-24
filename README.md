@@ -10,7 +10,6 @@
   ![License](https://img.shields.io/badge/License-MIT-green)
 </div>
 
-在 macOS 的灵动岛(Dynamic Island)风格浮窗中实时显示 Apple Music 同步歌词。支持两种布局模式、自定义字体和颜色、全屏自动隐藏。
 
 ## 特性
 
