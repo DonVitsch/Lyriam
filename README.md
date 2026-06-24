@@ -1,12 +1,16 @@
-# Lyriam
+<div align="center">
+  <img src="Resources/AppIcon.png" width="120" height="120" alt="Lyriam logo">
 
-**Apple Music 同步歌词浮窗** — macOS 菜单栏应用
+  # Lyriam
+
+  **Apple Music 同步歌词浮窗** — macOS 菜单栏应用
+
+  ![macOS](https://img.shields.io/badge/macOS-14.0+-blue)
+  ![Swift](https://img.shields.io/badge/Swift-5.9+-orange)
+  ![License](https://img.shields.io/badge/License-MIT-green)
+</div>
 
 在 macOS 的灵动岛(Dynamic Island)风格浮窗中实时显示 Apple Music 同步歌词。支持两种布局模式、自定义字体和颜色、全屏自动隐藏。
-
-![Lyriam](https://img.shields.io/badge/macOS-14.0+-blue)
-![Swift](https://img.shields.io/badge/Swift-5.9+-orange)
-![License](https://img.shields.io/badge/License-MIT-green)
 
 ## 特性
 
