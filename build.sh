@@ -47,5 +47,12 @@ cp -r Resources/* "$APP_BUNDLE/Contents/Resources/" 2>/dev/null || true
 echo "Code signing (ad-hoc)..."
 codesign --force --deep --sign - "$APP_BUNDLE"
 
+DMG_STAGING_DIR="$BUILD_DIR/dmg-staging"
+rm -rf "$DMG_STAGING_DIR"
+mkdir -p "$DMG_STAGING_DIR"
+cp -R "$APP_BUNDLE" "$DMG_STAGING_DIR/"
+ln -s /Applications "$DMG_STAGING_DIR/Applications"
+
 echo "Built: $APP_BUNDLE"
+echo "DMG staging prepared: $DMG_STAGING_DIR"
 echo "Run with: open '$APP_BUNDLE'"
