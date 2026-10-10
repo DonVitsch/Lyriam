@@ -1,73 +1,106 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
+/// Alcove-style Dynamic Island with Lyriam lyrics always on:
+/// - Collapsed: artwork · camera · waveform + **lyric marquee**
+/// - Expanded: media card + **synced lyrics**
 struct NotchView: View {
     @ObservedObject var nowPlaying: NowPlayingMonitor
     @ObservedObject var lyrics: LyricsRepository
     @ObservedObject var sync: LyricsSyncEngine
     @ObservedObject var state: IslandState
+    @ObservedObject var activities: IslandActivityCenter
+    @ObservedObject var systemControls: SystemControlsMonitor
+    @ObservedObject var headphones: BluetoothDevicesMonitor
+    @ObservedObject var battery: BatteryMonitor
+    @ObservedObject var clipboard: ClipboardStore
+    @ObservedObject var fileShelf: FileShelfStore
+    @ObservedObject var focusTimer: FocusTimerStore
+    @ObservedObject var notes: NotesStore
+    @ObservedObject var camera: CameraMirrorController
+    @ObservedObject var network: NetworkDashboardMonitor
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var settings = AppSettings.shared
     var onOpenSettings: () -> Void = {}
 
     @State private var glow: Color = .clear
-
     private var barHeight: CGFloat { state.barHeight }
-    private let cardHeight = NotchPanel.cardHeight
+
+    private var isPlaying: Bool { nowPlaying.current?.isPlaying ?? false }
+    private var hasTrack: Bool {
+        guard let t = nowPlaying.current?.title else { return false }
+        return !t.isEmpty
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             if state.expanded {
-                Color.clear.frame(height: state.menuBarZone)   // menu bar shows through here
-                card
-                    .frame(maxHeight: .infinity)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                // Original v0.1 transparent menu-bar strip: never paint this black.
+                Color.clear.frame(height: state.menuBarZone)
+                expandedContent
+                    .frame(width: NotchPanel.expandedWidth, height: NotchPanel.cardHeight)
+                    .clipped()
+                    .background(
+                        ZStack {
+                            Color.black
+                            RadialGradient(colors: [glow.opacity(0.55), .clear],
+                                           center: .topLeading, startRadius: 10, endRadius: 420)
+                            LinearGradient(colors: [glow.opacity(0.25), .clear],
+                                           startPoint: .bottomTrailing, endPoint: .center)
+                        }
+                    )
+                    .clipShape(LegacyExpandedShape())
+                    .transition(.opacity)
             } else {
-                barRow
+                HStack(spacing: 0) {
+                    Color.clear.frame(width: state.barLeadingInset)
+                    ZStack {
+                        barBackground
+                        Group {
+                            if let activity = activities.current {
+                                IslandActivityView(activity: activity, state: state, feedbackSequence: activities.feedbackSequence)
+                            } else if settings.islandMode == .notchCentered {
+                                centeredBar
+                            } else {
+                                leftSafeBar
+                            }
+                        }
+                        .frame(width: state.barWidth, height: state.barHeight)
+                        .mask(barBackground)
+                    }
+                    .frame(width: state.barWidth, height: state.barHeight)
+                    Spacer(minLength: 0)
+                }
+                .frame(height: state.barHeight)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: state.expanded)
+        .foregroundStyle(.white)
+        .environment(\.colorScheme, .dark)
+        // The window transition is composited by AppKit, without a second layout animation.
+        .animation(nil, value: state.expanded)
+        .animation(.easeInOut(duration: 0.18), value: activities.current?.key)
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $state.isReceivingDrop, perform: receiveFiles)
+        .onChange(of: state.isReceivingDrop) { _, targeted in
+            if targeted && settings.fileShelfEnabled {
+                NotificationCenter.default.post(name: .lyriamOpenIslandPage, object: IslandPage.files)
+            }
+        }
         .task(id: nowPlaying.current?.artwork.map { ObjectIdentifier($0) }) {
             glow = nowPlaying.current?.artwork?.averageColor() ?? .clear
         }
     }
 
-    // MARK: - Menu-bar row: two wings wrapping the notch
-
-    /// One continuous black bar, entirely left of the camera (its right edge
-    /// hugs the notch). Right-aligned within the window so that when the window
-    /// grows wider on expand, the bar stays pinned at the top-right.
-    private var barRow: some View {
-        HStack(spacing: 0) {
-            Color.clear.frame(width: state.barLeadingInset)   // keeps bar aligned to notch
-            barContent.frame(width: state.barWidth)
-            Spacer(minLength: 0)
-        }
-        .frame(height: barHeight)
-    }
-
-    /// One continuous black bar: lyrics · album art · [camera, blacked out] · equalizer.
-    /// The ticker and equalizer are centered in the top menu-bar band so they
-    /// align with the real menu items; the enlarged album art hangs below.
-    private var barContent: some View {
-        ZStack {
-            barBackground
-            if settings.islandMode == .notchCentered {
-                centeredBar
-            } else {
-                leftSafeBar
-            }
-        }
-        .frame(height: barHeight)
-    }
+    // MARK: - Collapsed
 
     /// leftSafe mode: lyrics ticker · album art · [camera] · equalizer cap.
     private var leftSafeBar: some View {
-        let artSize = barHeight - 4
+        let artSize = barHeight - 2
         return HStack(spacing: 0) {
             leftWing(artSize: artSize).frame(width: state.leftWingWidth)
             Color.clear.frame(width: state.gap)
-            PlayingBars(isPlaying: nowPlaying.current?.isPlaying ?? false)
+            WaveformView(isPlaying: isPlaying, barCount: 4, maxHeight: 15, barWidth: 3, spacing: 3, enabled: settings.useLiveWaveform)
                 .frame(height: state.menuBarZone)
                 .frame(maxHeight: .infinity, alignment: .top)
                 .frame(width: state.rightCapWidth, alignment: .center)   // centered in the right cap
@@ -82,7 +115,7 @@ struct NotchView: View {
             // row was vertically centered by the surrounding ZStack, which made
             // it fall into the lyric area.
             centeredTopRow
-                .frame(height: state.menuBarZone, alignment: .top)
+                .frame(height: centeredTopHeight, alignment: .top)
 
             // Keep a single compact lyric line immediately below the camera.
             Text(collapsedText)
@@ -99,26 +132,22 @@ struct NotchView: View {
     }
 
     private var centeredTopRow: some View {
-        let indicatorSize = max(state.menuBarZone - 8, 22)
+        let indicatorSize = min(state.leftWingWidth - 16, centeredTopHeight - 2)
         return HStack(spacing: 0) {
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
-                artwork(size: indicatorSize, corner: 7)
-            }
+            artwork(size: indicatorSize, corner: 8)
+            .padding(.leading, 12)
             .frame(width: state.leftWingWidth)
-            .padding(.trailing, 4)
 
             Color.clear.frame(width: state.gap)   // physical camera
 
-            HStack(spacing: 0) {
-                PlayingBars(isPlaying: nowPlaying.current?.isPlaying ?? false)
-                Spacer(minLength: 0)
-            }
+            WaveformView(isPlaying: isPlaying, barCount: 4, maxHeight: 15, barWidth: 3, spacing: 3, enabled: settings.useLiveWaveform)
+            .padding(.trailing, 12)
             .frame(width: state.rightCapWidth)
-            .padding(.leading, 6)
         }
-        .frame(height: state.menuBarZone, alignment: .center)
+        .frame(height: centeredTopHeight, alignment: .center)
     }
+
+    private var centeredTopHeight: CGFloat { min(state.menuBarZone + 4, barHeight - 20) }
 
     private var centeredFontSize: CGFloat {
         min(settings.lyricFontSize, 16)
@@ -148,21 +177,6 @@ struct NotchView: View {
         .padding(.leading, 16)
     }
 
-    /// Lyric text color per settings (custom color or album-art theme color).
-    private var lyricTextColor: Color {
-        settings.lyricColor(artworkColor: glow == .clear ? nil : glow)
-    }
-
-    /// True when the bar is showing an actual lyric line written in CJK script.
-    private var isCJKLyric: Bool {
-        guard currentLyricLine != nil else { return false }
-        return collapsedText.unicodeScalars.contains { s in
-            (0x4E00...0x9FFF).contains(s.value) ||   // CJK unified ideographs
-            (0x3040...0x30FF).contains(s.value) ||   // Japanese kana
-            (0xAC00...0xD7A3).contains(s.value)      // Korean hangul
-        }
-    }
-
     @ViewBuilder
     private var barBackground: some View {
         if settings.islandMode == .notchCentered && !state.expanded {
@@ -180,96 +194,215 @@ struct NotchView: View {
         }
     }
 
+    private var availablePages: [IslandPage] {
+        IslandPage.allCases.filter {
+            ($0 != .clipboard || settings.clipboardEnabled) && ($0 != .files || settings.fileShelfEnabled)
+        }
+    }
+
+    private func receiveFiles(_ providers: [NSItemProvider]) -> Bool {
+        guard settings.fileShelfEnabled else { return false }
+        let supported = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !supported.isEmpty else { return false }
+        for provider in supported {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url: URL?
+                if let value = item as? URL { url = value }
+                else if let value = item as? Data { url = URL(dataRepresentation: value, relativeTo: nil) }
+                else if let value = item as? String { url = URL(string: value) }
+                else { url = nil }
+                guard let url, url.isFileURL else { return }
+                Task { @MainActor in _ = fileShelf.add([url]) }
+            }
+        }
+        NotificationCenter.default.post(name: .lyriamOpenIslandPage, object: IslandPage.files)
+        return true
+    }
+
+    private var indicatorSize: CGFloat {
+        max(min(state.menuBarZone - 12, 18), 14)
+    }
+
+    private var collapsedFontSize: CGFloat {
+        let base = settings.lyricFontSize
+        if currentLyricLine != nil {
+            return isCJKLyric ? min(base, 14) : min(base * 0.85, 13)
+        }
+        return 11
+    }
+
     private var collapsedText: String {
-        if let line = currentLyricLine { return line }
-        guard let info = nowPlaying.current, !info.title.isEmpty else { return "未在播放" }
-        return info.artist.isEmpty ? info.title : "\(info.title) - \(info.artist)"
+        if settings.showLyricsOnIsland, let line = currentLyricLine, !line.isEmpty {
+            return line
+        }
+        guard let info = nowPlaying.current, !info.title.isEmpty else {
+            return "未在播放"
+        }
+        return info.artist.isEmpty ? info.title : "\(info.title)  ·  \(info.artist)"
+    }
+
+    // MARK: - Expanded
+
+    private var expandedContent: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                HStack(spacing: 5) {
+                    ForEach(availablePages) { page in
+                        Button {
+                            NotificationCenter.default.post(name: .lyriamOpenIslandPage, object: page)
+                        } label: {
+                            Image(systemName: page.symbol)
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 32, height: 26)
+                                .foregroundStyle(state.selectedPage == page ? .white : .white.opacity(0.65))
+                                .background(state.selectedPage == page ? .white.opacity(0.10) : .clear,
+                                            in: RoundedRectangle(cornerRadius: 8))
+                        }
+                        .buttonStyle(IslandPressStyle()).help(page.title)
+                        .accessibilityLabel(page.title)
+                    }
+                    if case let .hud(kind, value, muted, atLimit) = activities.current {
+                        ExpandedHUDFeedback(kind: kind, value: value, muted: muted,
+                                            atLimit: atLimit, sequence: activities.feedbackSequence)
+                            .padding(.leading, 5)
+                    } else {
+                        Text(state.selectedPage.title)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.7)).padding(.leading, 5)
+                    }
+                    Spacer(minLength: 0)
+                    if settings.showNetworkDashboard {
+                        NetworkDashboardStatusView(monitor: network)
+                        .frame(maxWidth: 180, alignment: .trailing)
+                        .padding(.trailing, 10)
+                    }
+                    chromeButtons
+                }
+                .padding(.bottom, 10)
+
+                Group {
+                    switch state.selectedPage {
+                    case .music:
+                        if settings.showLyricsInExpanded {
+                            HStack(alignment: .top, spacing: 18) {
+                                playerColumn.frame(width: 410, alignment: .leading)
+                                lyricsColumn.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                            }
+                        } else {
+                            playerColumn.frame(maxWidth: .infinity)
+                        }
+                    case .controls:
+                        SystemControlsView(controls: systemControls, battery: battery)
+                    case .devices:
+                        HeadphonesView(monitor: headphones)
+                    case .clipboard:
+                        ClipboardHistoryView(store: clipboard)
+                    case .files:
+                        FileShelfView(store: fileShelf)
+                    case .timer:
+                        FocusTimerView(store: focusTimer)
+                    case .notes:
+                        QuickNotesView(store: notes)
+                    case .mirror:
+                        CameraMirrorView(controller: camera)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .transition(.opacity)
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 16)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+    }
+
+    private var chromeButtons: some View {
+        HStack(spacing: 10) {
+            iconButton("gearshape", help: "设置") { onOpenSettings() }
+            iconButton(state.pinned ? "pin.fill" : "pin",
+                       help: state.pinned ? "取消固定" : "固定展开",
+                       accent: state.pinned ? Color.yellow : nil) {
+                state.pinned.toggle()
+                if state.pinned { state.expanded = true }
+            }
+            iconButton("power", help: "退出 Lyriam") { NSApp.terminate(nil) }
+        }
+    }
+
+    private var playerColumn: some View {
+        HStack(spacing: 18) {
+            artwork(size: 168, corner: 16)
+            VStack(alignment: .leading, spacing: 9) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(nowPlaying.current?.title ?? "未在播放")
+                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+                    Text(nowPlaying.current?.artist ?? "")
+                        .font(.system(size: 12)).foregroundStyle(.white.opacity(0.55)).lineLimit(1)
+                }
+                progressBar
+                controls
+                if settings.useLiveWaveform {
+                    ExpandedWaveform(isPlaying: isPlaying, color: .white.opacity(0.8), barCount: 28)
+                        .frame(height: 12)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxHeight: .infinity, alignment: .center)
+    }
+
+    private var lyricsColumn: some View {
+        Group {
+            if lyrics.isLoading {
+                Text("正在加载歌词…")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.4))
+            } else if lyrics.currentLines.isEmpty {
+                Text("暂无歌词")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.4))
+            } else {
+                let idx = sync.currentIndex ?? -1
+                VStack(alignment: .center, spacing: 10) {
+                    ForEach(visibleWindow(around: idx), id: \.self) { i in
+                        Text(lyrics.currentLines[i].text)
+                            .font(settings.font(
+                                size: i == idx ? 17 : 13,
+                                weight: i == idx ? .bold : .regular
+                            ))
+                            .foregroundStyle(i == idx ? lyricTextColor : Color.white.opacity(0.38))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .animation(.easeInOut(duration: 0.2), value: idx)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .padding(.horizontal, 8)
+    }
+
+    // MARK: - Shared
+
+    private var lyricTextColor: Color {
+        settings.lyricColor(artworkColor: glow == .clear ? nil : glow)
     }
 
     private var currentLyricLine: String? {
         guard let idx = sync.currentIndex, lyrics.currentLines.indices.contains(idx) else { return nil }
-        return lyrics.currentLines[idx].text
+        let t = lyrics.currentLines[idx].text
+        return t.isEmpty ? nil : t
     }
 
-    // MARK: - Dropped card
-
-    private var card: some View {
-        HStack(spacing: 18) {
-            playerPane
-            Divider().overlay(Color.white.opacity(0.12))
-            lyricsPane
+    private var isCJKLyric: Bool {
+        guard currentLyricLine != nil else { return false }
+        return collapsedText.unicodeScalars.contains { s in
+            (0x4E00...0x9FFF).contains(s.value)
+                || (0x3040...0x30FF).contains(s.value)
+                || (0xAC00...0xD7A3).contains(s.value)
         }
-        .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            ZStack {
-                Color.black
-                RadialGradient(colors: [glow.opacity(0.55), .clear],
-                               center: .topLeading, startRadius: 10, endRadius: 420)
-                LinearGradient(colors: [glow.opacity(0.25), .clear],
-                               startPoint: .bottomTrailing, endPoint: .center)
-            }
-        )
-        .clipShape(UnevenRoundedRectangle(
-            topLeadingRadius: 20, bottomLeadingRadius: 30,
-            bottomTrailingRadius: 30, topTrailingRadius: 20, style: .continuous))
-        .overlay(alignment: .topTrailing) {
-            HStack(spacing: 14) {
-                settingsButton
-                pinButton
-                quitButton
-            }
-            .padding(10)
-        }
-    }
-
-    private var settingsButton: some View {
-        Button { onOpenSettings() } label: {
-            Image(systemName: "gearshape")
-                .font(.system(size: 12))
-                .foregroundStyle(.white.opacity(0.6))
-        }
-        .buttonStyle(.plain)
-        .help("设置")
-    }
-
-    private var pinButton: some View {
-        Button { state.pinned.toggle() } label: {
-            Image(systemName: state.pinned ? "pin.fill" : "pin")
-                .font(.system(size: 12))
-                .foregroundStyle(state.pinned ? Color.yellow : .white.opacity(0.6))
-        }
-        .buttonStyle(.plain)
-        .help(state.pinned ? "取消固定" : "固定展开")
-    }
-
-    private var quitButton: some View {
-        Button { NSApp.terminate(nil) } label: {
-            Image(systemName: "power")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.6))
-        }
-        .buttonStyle(.plain)
-        .help("退出 Lyriam")
-    }
-
-    private var playerPane: some View {
-        HStack(spacing: 18) {
-            artwork(size: 180, corner: 16)
-                .id(nowPlaying.current?.title ?? "")
-                .transition(.scale.combined(with: .opacity))
-            VStack(alignment: .leading, spacing: 8) {
-                Text(nowPlaying.current?.title ?? "未在播放")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.white).lineLimit(1)
-                Text(nowPlaying.current?.artist ?? "")
-                    .font(.system(size: 15)).foregroundStyle(.white.opacity(0.65)).lineLimit(1)
-                progressBar
-                controls
-            }
-            .frame(width: 230, alignment: .leading)
-        }
-        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: nowPlaying.current?.title)
     }
 
     private func artwork(size: CGFloat, corner: CGFloat) -> some View {
@@ -279,8 +412,8 @@ struct NotchView: View {
             } else {
                 ZStack {
                     Color.white.opacity(0.08)
-                    Image(systemName: "music.note")
-                        .font(.system(size: size * 0.4))
+                    Image(systemName: hasTrack ? "music.note" : "moon.zzz")
+                        .font(.system(size: size * 0.36))
                         .foregroundStyle(.white.opacity(0.4))
                 }
             }
@@ -296,64 +429,59 @@ struct NotchView: View {
         return VStack(spacing: 4) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.18))
-                    Capsule().fill(Color.white.opacity(0.9)).frame(width: geo.size.width * fraction)
+                    Capsule().fill(Color.white.opacity(0.14))
+                    Capsule()
+                        .fill(Color.white.opacity(0.9))
+                        .frame(width: max(3, geo.size.width * fraction))
                 }
             }
-            .frame(height: 5)
+            .frame(height: 3.5)
             HStack {
-                Text(timeString(elapsed)).font(.system(size: 11)).foregroundStyle(.white.opacity(0.5))
+                Text(timeString(elapsed))
+                    .font(.system(size: 10, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.42))
                 Spacer()
-                Text(timeString(duration)).font(.system(size: 11)).foregroundStyle(.white.opacity(0.5))
+                Text(timeString(duration))
+                    .font(.system(size: 10, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.42))
             }
         }
     }
 
     private var controls: some View {
-        HStack(spacing: 28) {
-            Spacer()
-            controlButton("backward.fill", size: 18) { nowPlaying.previousTrack() }
-            controlButton((nowPlaying.current?.isPlaying ?? false) ? "pause.fill" : "play.fill", size: 22) {
+        HStack(spacing: 26) {
+            Spacer(minLength: 0)
+            controlButton("backward.fill", size: 14) { nowPlaying.previousTrack() }
+            controlButton(isPlaying ? "pause.fill" : "play.fill", size: 18) {
                 nowPlaying.playPause()
             }
-            controlButton("forward.fill", size: 18) { nowPlaying.nextTrack() }
-            Spacer()
+            controlButton("forward.fill", size: 14) { nowPlaying.nextTrack() }
+            Spacer(minLength: 0)
         }
-        .padding(.top, 2)
+        .padding(.vertical, 2)
     }
 
     private func controlButton(_ symbol: String, size: CGFloat, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: symbol).font(.system(size: size)).foregroundStyle(.white)
+            Image(systemName: symbol)
+                .font(.system(size: size, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 32, height: 32)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(IslandPressStyle())
+    }
+
+    private func iconButton(_ symbol: String, help: String, accent: Color? = nil, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(accent ?? Color.white.opacity(0.5))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-
-    private var lyricsPane: some View {
-        lyricLines
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            .padding(.top, 28)   // nudge the lyric block downward
-    }
-
-    @ViewBuilder
-    private var lyricLines: some View {
-        if lyrics.isLoading {
-            Text("正在加载歌词…").font(.system(size: 16)).foregroundStyle(.white.opacity(0.4))
-        } else if lyrics.currentLines.isEmpty {
-            Text("暂无歌词").font(.system(size: 16)).foregroundStyle(.white.opacity(0.4))
-        } else {
-            let idx = sync.currentIndex ?? -1
-            VStack(alignment: .leading, spacing: 12) {
-                ForEach(visibleWindow(around: idx), id: \.self) { i in
-                    Text(lyrics.currentLines[i].text)
-                        .font(settings.font(size: i == idx ? 23 : 17, weight: i == idx ? .bold : .regular))
-                        .foregroundStyle(i == idx ? lyricTextColor : Color.white.opacity(0.45))
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .animation(.easeInOut(duration: 0.25), value: idx)
-                }
-            }
-        }
+        .help(help)
     }
 
     private func visibleWindow(around idx: Int) -> [Int] {
@@ -361,7 +489,7 @@ struct NotchView: View {
         guard count > 0 else { return [] }
         let center = idx < 0 ? 0 : idx
         let start = max(0, center - 1)
-        let end = min(count - 1, start + 2)
+        let end = min(count - 1, center + 1)
         return Array(start...end)
     }
 
@@ -372,54 +500,20 @@ struct NotchView: View {
     }
 }
 
-/// Centered island silhouette: a full-width top band flows outward into the
-/// menu bar, then turns inward with two concave shoulder curves. The hanging
-/// body finishes with Apple's softer continuous-looking lower corners.
-/// Notch-style island: top edge flush with the screen top and full width, with
-/// small OUTWARD-flaring fillets at the two top corners (so it grows smoothly
-/// out of the menu bar, not an inward dent), and Apple-style rounded corners at
-/// the bottom. One continuous shape.
-private struct CenteredIslandShape: Shape {
-    var topFlare: CGFloat = 12
-    var bottomRadius: CGFloat = 20
-
-    func path(in rect: CGRect) -> Path {
-        let w = rect.width, h = rect.height
-        let f = min(topFlare, w / 2, h / 2)
-        let b = min(bottomRadius, (w - 2 * f) / 2, h - f)
-
-        var p = Path()
-        p.move(to: CGPoint(x: 0, y: 0))                                   // top-left, at screen top
-        p.addQuadCurve(to: CGPoint(x: f, y: f),                           // outward flare → body left
-                       control: CGPoint(x: f, y: 0))
-        p.addLine(to: CGPoint(x: f, y: h - b))                           // left side
-        p.addQuadCurve(to: CGPoint(x: f + b, y: h),                       // bottom-left rounded
-                       control: CGPoint(x: f, y: h))
-        p.addLine(to: CGPoint(x: w - f - b, y: h))                       // bottom edge
-        p.addQuadCurve(to: CGPoint(x: w - f, y: h - b),                   // bottom-right rounded
-                       control: CGPoint(x: w - f, y: h))
-        p.addLine(to: CGPoint(x: w - f, y: f))                           // right side
-        p.addQuadCurve(to: CGPoint(x: w, y: 0),                           // outward flare → top-right
-                       control: CGPoint(x: w - f, y: 0))
-        p.closeSubpath()                                                  // top edge
-        return p
-    }
+extension Notification.Name {
+    static let lyriamShowHeadphoneConnection = Notification.Name("lyriamShowHeadphoneConnection")
+    static let lyriamCollapseIsland = Notification.Name("lyriamCollapseIsland")
+    static let lyriamBeginFilePicker = Notification.Name("lyriamBeginFilePicker")
+    static let lyriamEndFilePicker = Notification.Name("lyriamEndFilePicker")
+    static let lyriamOpenIslandPage = Notification.Name("lyriamOpenIslandPage")
 }
 
-/// Animated equalizer bars shown in the right wing.
-struct PlayingBars: View {
-    var isPlaying: Bool
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 0.08, paused: !isPlaying)) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
-            HStack(alignment: .center, spacing: 3) {
-                ForEach(0..<4, id: \.self) { i in
-                    let h = isPlaying ? (4 + 11 * abs(sin(t * 4 + Double(i) * 0.9))) : 4
-                    Capsule().fill(Color.white.opacity(0.9)).frame(width: 3, height: h)
-                }
-            }
-            .frame(width: 24, height: 18)
-        }
+struct IslandPressStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.65 : 1)
+            .scaleEffect(reduceMotion ? 1 : configuration.isPressed ? 0.94 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }

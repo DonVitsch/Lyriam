@@ -13,7 +13,7 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.6.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
@@ -24,5 +24,9 @@
     <string>用于读取 Apple Music 当前播放信息以显示同步歌词。</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Lyriam 用于显示蓝牙耳机的连接状态和设备可提供的电量。</string>
+    <key>NSCameraUsageDescription</key>
+    <string>点击开启小镜子时，Lyriam 使用摄像头显示实时预览；不会录制或上传。</string>
 </dict>
 </plist>

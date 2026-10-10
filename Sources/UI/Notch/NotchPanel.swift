@@ -2,37 +2,38 @@ import AppKit
 import SwiftUI
 import Combine
 
-/// Shared island state, driven by the panel and observed by SwiftUI.
+/// Shared island state observed by SwiftUI.
 @MainActor
 final class IslandState: ObservableObject {
     @Published var expanded = false
     @Published var pinned = false
-    /// Width of the collapsed bar (points); the bar is right-aligned inside the
-    /// (wider) expanded window so its right edge stays at the equalizer cap.
+    @Published var selectedPage: IslandPage = .music
+    @Published var isReceivingDrop = false
+    @Published var isPresentingFilePicker = false
+    /// 0…1 morph progress for the island silhouette.
+    @Published var expandProgress: CGFloat = 0
+    /// Original calibrated collapsed bar and its internal segments.
     @Published var barWidth: CGFloat = 575
-    // Internal layout segments of the bar.
-    @Published var leftWingWidth: CGFloat = 330   // lyrics + album art (left of camera)
-    @Published var gap: CGFloat = 185             // camera (painted black)
-    @Published var rightCapWidth: CGFloat = 60    // equalizer (right of camera)
-    /// Left inset of the bar within the window. 0 when collapsed; when expanded
-    /// the window is centered on the camera, so the bar shifts to stay aligned.
+    @Published var leftWingWidth: CGFloat = 330
+    @Published var gap: CGFloat = 185
+    @Published var rightCapWidth: CGFloat = 60
     @Published var barLeadingInset: CGFloat = 0
-    /// Height of the menu-bar band; the ticker/equalizer are centered in this
-    /// top zone so they line up with the real menu bar items (Window/帮助…).
     @Published var menuBarZone: CGFloat = 37
-    /// Collapsed bar height. Centered mode adds only a compact lyric band below
-    /// the camera instead of extending deep into the screen.
     @Published var barHeight: CGFloat = 58
+    // Activity layouts share the original bar's dimensions.
+    var collapsedWidth: CGFloat { barWidth }
+    var collapsedHeight: CGFloat { barHeight }
+    var leftWing: CGFloat { leftWingWidth }
+    var rightWing: CGFloat { rightCapWidth }
+    /// Screen X of camera center.
+    @Published var notchCenterX: CGFloat = 0
 }
 
-/// "Dynamic island" that wraps the notch: one continuous black bar runs from the
-/// lyrics on the left, across the (blacked-out) camera, to the equalizer on the
-/// right. The bar's right edge stops at `notchRight + rightCap`, well before the
-/// menu bar's status icons, so it never covers them.
+/// The original calibrated bar wraps the notch; its expanded card is centered
+/// below a transparent menu-bar band.
 ///
-/// Click-through: while collapsed the window ignores mouse events so the menu
-/// bar underneath stays clickable; only when expanded does it accept clicks.
-/// Hover is polled from the global mouse location.
+/// Click-through: when collapsed and not pinned, mouse events are accepted only
+/// so hover/click can expand; when expanded the full card is interactive.
 final class NotchPanel: NSPanel {
     static let leftWingWidth: CGFloat = 330
     static let rightCapWidth: CGFloat = 34
@@ -45,10 +46,39 @@ final class NotchPanel: NSPanel {
 
     let state = IslandState()
     private var trackingTimer: Timer?
-    private var barWidth: CGFloat = 575
-    private var barLeftScreen: CGFloat = 0   // screen x of bar's left edge
-    private var notchCenter: CGFloat = 0     // screen x of camera center
+    private var fullscreenTimer: Timer?
+    private var userVisible = true
+    private var sessionProtected = false
+    private var anchoredDisplayNumber: NSNumber?
+    private var fullscreenExitTicks = 0
+    private var hoverAccum: TimeInterval = 0
+    private var lastTick: Date = .distantPast
     private var cancellables: Set<AnyCancellable> = []
+    private var localMonitor: Any?
+    private var globalMonitor: Any?
+    private var windowTransition: IslandWindowTransition?
+    private var barWidth: CGFloat = 575
+    private var barLeftScreen: CGFloat = 0
+    private var notchCenter: CGFloat = 0
+
+    /// Optional callbacks for swipe gestures.
+    var onSwipeSkipNext: (() -> Void)?
+    var onSwipeSkipPrevious: (() -> Void)?
+    var onPresentationChange: (() -> Void)?
+    var isPointerOverAccessory: (() -> Bool)?
+
+    /// Accessory cards follow the notch without changing this window's outline.
+    var accessoryScreen: NSScreen? { geometryScreen }
+    var canPresentAccessories: Bool { userVisible && !hiddenForFullScreen && !sessionProtected && isVisible }
+    var accessoryAnchorFrame: NSRect {
+        var anchor = targetFrame(expanded: state.expanded)
+        anchor.origin.x = notchCenter - anchor.width / 2
+        return anchor
+    }
+    func prepareForAccessoryPresentation() -> Bool {
+        updateFullScreenVisibility()
+        return canPresentAccessories
+    }
 
     init<Content: View>(@ViewBuilder content: (IslandState) -> Content) {
         super.init(
@@ -59,40 +89,87 @@ final class NotchPanel: NSPanel {
         )
         isOpaque = false
         backgroundColor = .clear
+        appearance = NSAppearance(named: .darkAqua)
         hasShadow = true
         level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         isMovableByWindowBackground = false
         hidesOnDeactivate = false
-        ignoresMouseEvents = true
+        ignoresMouseEvents = false
+        acceptsMouseMovedEvents = true
+        becomesKeyOnlyIfNeeded = true
 
         computeGeometry()
 
         let hosting = NSHostingView(rootView: content(state))
-        hosting.autoresizingMask = [.width, .height]
-        contentView = hosting
+        // Native previews must never resize the calibrated window to their ideal size.
+        hosting.sizingOptions = []
+        let transition = IslandWindowTransition(hosting: hosting)
+        windowTransition = transition
+        contentView = transition.container
 
         applyFrame(expanded: false, animated: false)
         startTracking()
+        fullscreenTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateFullScreenVisibility() }
+        }
+        if let fullscreenTimer { RunLoop.main.add(fullscreenTimer, forMode: .common) }
+        for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didActivateApplicationNotification,
+                     NSWorkspace.didWakeNotification] {
+            NSWorkspace.shared.notificationCenter.publisher(for: name)
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.updateFullScreenVisibility() }
+                .store(in: &cancellables)
+        }
 
-        // React to island-mode changes from the settings window.
-        AppSettings.shared.$islandMode
-            .dropFirst()
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 guard let self else { return }
                 self.computeGeometry()
-                self.applyFrame(expanded: self.state.expanded, animated: true)
+                self.applyFrame(expanded: self.state.expanded, animated: false)
+                self.updateFullScreenVisibility()
+            }
+            .store(in: &cancellables)
+
+        // Tuning / mode changes from settings.
+        AppSettings.shared.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                // Defer one runloop so published values are committed.
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.computeGeometry()
+                    self.applyFrame(expanded: self.state.expanded, animated: true)
+                    self.updateFullScreenVisibility()
+                }
             }
             .store(in: &cancellables)
     }
 
-    deinit { trackingTimer?.invalidate() }
+    deinit {
+        trackingTimer?.invalidate()
+        fullscreenTimer?.invalidate()
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+    }
 
-    /// Align the camera gap to the physical notch and pin the right edge to
-    /// `notchRight + rightCap`.
+    // MARK: - Geometry
+
+    /// Keep the calibrated island on its original display when focus changes.
+    /// Re-anchor only when that display is physically disconnected.
+    private var geometryScreen: NSScreen? {
+        if let anchoredDisplayNumber,
+           let existing = NSScreen.screens.first(where: {
+               ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber) == anchoredDisplayNumber
+           }) { return existing }
+        guard let replacement = NSScreen.main ?? NSScreen.screens.first else { return nil }
+        anchoredDisplayNumber = replacement.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+        return replacement
+    }
+
     private func computeGeometry() {
-        guard let screen = NSScreen.main else { return }
+        guard let screen = geometryScreen else { return }
         let notchLeft: CGFloat
         let notchRight: CGFloat
         if let left = screen.auxiliaryTopLeftArea,
@@ -101,121 +178,243 @@ final class NotchPanel: NSPanel {
             notchLeft = left.maxX
             notchRight = right.minX
         } else {
-            // No notch: fake a small centered gap so layout still works.
+            // Original fallback for displays without a physical notch.
             notchLeft = screen.frame.midX - 90
             notchRight = screen.frame.midX + 90
         }
         let gap = notchRight - notchLeft
-        // Geometry depends on the mode:
-        //  • leftSafe: wide left wing + tight right cap, never reaches the
-        //    right-side apps.
-        //  • notchCentered: smaller symmetric wings, centered on the camera
-        //    (art top-left, equalizer top-right edge, text centered below).
         let centered = AppSettings.shared.islandMode == .notchCentered
-        // Centered mode: compact wings so album art hugs the camera's left edge
-        // and the equalizer hugs its right edge; lyrics wrap below the camera.
-        let leftWing: CGFloat = centered ? Self.centeredLeftWingWidth : Self.leftWingWidth
-        let rightWing: CGFloat = centered ? Self.centeredRightWingWidth : Self.rightCapWidth
+        let leftWing = centered ? Self.centeredLeftWingWidth : Self.leftWingWidth
+        let rightWing = centered ? Self.centeredRightWingWidth : Self.rightCapWidth
         barWidth = leftWing + gap + rightWing
         barLeftScreen = notchLeft - leftWing
         notchCenter = (notchLeft + notchRight) / 2
         state.menuBarZone = screen.safeAreaInsets.top > 0 ? screen.safeAreaInsets.top : 24
-        // Keep just enough room for one lyric line below the physical notch.
-        // This makes the visible drop roughly three-fifths of the old 88pt bar.
         state.barHeight = centered ? max(state.menuBarZone + 24, 56) : 58
         state.gap = gap
         state.leftWingWidth = leftWing
         state.rightCapWidth = rightWing
         state.barWidth = barWidth
+        state.notchCenterX = notchCenter
     }
 
     private func expandedWindowLeft() -> CGFloat { notchCenter - Self.expandedWidth / 2 }
 
     private func targetFrame(expanded: Bool) -> NSRect {
-        // Both windows are pinned to the screen top. The expanded window includes
-        // a transparent menu-bar strip on top so the menu bar shows through and
-        // the hover zone still covers the collapsed bar's location (no flicker).
         let width = expanded ? Self.expandedWidth : barWidth
-        let height = expanded ? (state.menuBarZone + Self.cardHeight) : state.barHeight
+        let height = expanded ? state.menuBarZone + Self.cardHeight : state.barHeight
         let x = expanded ? expandedWindowLeft() : barLeftScreen
-        guard let screen = NSScreen.main else {
+        guard let screen = geometryScreen else {
             return NSRect(x: x, y: 0, width: width, height: height)
         }
         return NSRect(x: x, y: screen.frame.maxY - height, width: width, height: height)
     }
 
     private func applyFrame(expanded: Bool, animated: Bool) {
-        setFrame(targetFrame(expanded: expanded), display: true, animate: animated)
+        state.barLeadingInset = expanded ? barLeftScreen - expandedWindowLeft() : 0
+        let frame = targetFrame(expanded: expanded)
+        setFrame(frame, display: true)
+        windowTransition?.container.frame = CGRect(origin: .zero, size: frame.size)
+        windowTransition?.setFrame(CGRect(origin: .zero, size: frame.size))
+        onPresentationChange?()
     }
 
-    private func collapsedBarRect() -> CGRect {
-        guard let screen = NSScreen.main else { return .zero }
-        return CGRect(x: barLeftScreen, y: screen.frame.maxY - state.barHeight,
-                      width: barWidth, height: state.barHeight)
-    }
+    // MARK: - Hover / expand
 
     private func startTracking() {
-        trackingTimer = Timer.scheduledTimer(withTimeInterval: 0.09, repeats: true) { [weak self] _ in
+        lastTick = Date()
+        trackingTimer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateHover() }
+        }
+        if let trackingTimer { RunLoop.main.add(trackingTimer, forMode: .common) }
+        // Alcove-style swipe gestures + click-to-expand.
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .leftMouseUp]) { [weak self] event in
+            self?.handleLocalEvent(event)
+            return event
+        }
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
+            MainActor.assumeIsolated { self?.handleScroll(event) }
         }
     }
 
-    private var fsTick = 0
     private var hiddenForFullScreen = false
 
     private func updateHover() {
-        // Hide entirely while a full-screen app is frontmost (the menu bar / notch
-        // area is gone there, so the island would just float over content).
-        fsTick += 1
-        if fsTick % 5 == 0 { updateFullScreenVisibility() }
-        if hiddenForFullScreen { return }
+        let now = Date()
+        let dt = now.timeIntervalSince(lastTick)
+        lastTick = now
+
+        if hiddenForFullScreen || sessionProtected || !userVisible { return }
+        if state.isReceivingDrop || state.isPresentingFilePicker { return }
 
         if state.pinned {
             if !state.expanded { setExpanded(true) }
             return
         }
+
         let mouse = NSEvent.mouseLocation
+        let over = targetFrame(expanded: state.expanded).insetBy(dx: -4, dy: -4).contains(mouse)
+        let settings = AppSettings.shared
+
         if state.expanded {
-            if !targetFrame(expanded: true).insetBy(dx: -6, dy: -6).contains(mouse) {
+            if !over && !isKeyWindow && isPointerOverAccessory?() != true {
+                hoverAccum = 0
+                // Collapse only after leaving the card.
                 setExpanded(false)
             }
-        } else if collapsedBarRect().contains(mouse) {
-            setExpanded(true)
+        } else if settings.expandOnHover {
+            if over {
+                hoverAccum += dt
+                if hoverAccum >= settings.hoverDuration {
+                    setExpanded(true)
+                    hoverAccum = 0
+                }
+            } else {
+                hoverAccum = 0
+            }
+        } else {
+            hoverAccum = 0
+        }
+    }
+
+    private func handleLocalEvent(_ event: NSEvent) {
+        if event.type == .leftMouseUp {
+            // Click collapsed island → expand (Alcove default when hover-expand is off).
+            MainActor.assumeIsolated {
+                guard !state.expanded, !state.pinned else { return }
+                let mouse = NSEvent.mouseLocation
+                if frame.contains(mouse) {
+                    setExpanded(true)
+                }
+            }
+        } else if event.type == .scrollWheel {
+            MainActor.assumeIsolated { handleScroll(event) }
+        }
+    }
+
+    private func handleScroll(_ event: NSEvent) {
+        guard !hiddenForFullScreen, !sessionProtected, userVisible, state.selectedPage == .music else { return }
+        let settings = AppSettings.shared
+        let mouse = NSEvent.mouseLocation
+        guard frame.insetBy(dx: -8, dy: -8).contains(mouse) else { return }
+
+        let dx = event.scrollingDeltaX
+        let dy = event.scrollingDeltaY
+
+        // Vertical swipe → toggle expand (Alcove swipe-to-toggle).
+        if settings.swipeToToggle, abs(dy) > abs(dx), abs(dy) > 3 {
+            if dy < -2 { setExpanded(true) }
+            else if dy > 2, !state.pinned { setExpanded(false) }
+            return
+        }
+
+        // Horizontal swipe → skip tracks.
+        if settings.swipeToSkip, abs(dx) > abs(dy), abs(dx) > 4 {
+            if dx < -3 { onSwipeSkipNext?() }
+            else if dx > 3 { onSwipeSkipPrevious?() }
         }
     }
 
     private func updateFullScreenVisibility() {
-        let fs = NotchPanel.isFrontmostFullScreen()
-        if fs, !hiddenForFullScreen {
-            hiddenForFullScreen = true
-            if state.expanded { setExpanded(false) }
-            orderOut(nil)
-        } else if !fs, hiddenForFullScreen {
+        let fullscreen = AppSettings.shared.hideInFullscreen
+            && geometryScreen.map { FullscreenDetector.isFullscreen(on: $0) } == true
+        if fullscreen {
+            fullscreenExitTicks = 0
+            if !hiddenForFullScreen {
+                hiddenForFullScreen = true
+                hoverAccum = 0
+                setExpanded(false)
+                orderOut(nil)
+                onPresentationChange?()
+            }
+        } else if hiddenForFullScreen {
+            // Allow Space-transition windows to settle before restoring the island.
+            fullscreenExitTicks += 1
+            guard !AppSettings.shared.hideInFullscreen || fullscreenExitTicks >= 2 else { return }
             hiddenForFullScreen = false
-            orderFrontRegardless()
+            fullscreenExitTicks = 0
+            if userVisible && !sessionProtected { super.orderFrontRegardless() }
+            onPresentationChange?()
         }
     }
 
-    /// True when a full-screen space is active. The reliable cross-case signal
-    /// (Apple green-button full screen AND web/HTML5 video full screen) is that
-    /// the system menu bar is hidden — CGWindow bounds are unreliable on notched
-    /// displays because full-screen content sits below the notch.
-    private static func isFrontmostFullScreen() -> Bool {
-        guard let screen = NSScreen.main else { return false }
-        // In a full-screen space the menu bar auto-hides, so it no longer
-        // reserves space at the top of visibleFrame. On the desktop the menu
-        // bar (≈ notch height) is always reserved, giving a positive inset.
-        let topInset = screen.frame.maxY - screen.visibleFrame.maxY
-        return topInset < 1
+    func showIfAllowed() {
+        updateFullScreenVisibility()
+        if userVisible && !hiddenForFullScreen && !sessionProtected { super.orderFrontRegardless() }
+        onPresentationChange?()
     }
 
-    private func setExpanded(_ expanded: Bool) {
+    func toggleVisibility() {
+        userVisible.toggle()
+        if userVisible { showIfAllowed() }
+        else { orderOut(nil) }
+        onPresentationChange?()
+    }
+
+    func openPage(_ page: IslandPage) {
+        guard !sessionProtected else { return }
+        userVisible = true
+        state.selectedPage = page
+        showIfAllowed()
+        setExpanded(true)
+        if (page == .notes || page == .timer) && !hiddenForFullScreen && userVisible { makeKey() }
+        else if isKeyWindow { resignKey() }
+    }
+
+    func setSessionProtected(_ protected: Bool) {
+        guard sessionProtected != protected else { return }
+        sessionProtected = protected
+        if protected {
+            state.pinned = false
+            state.selectedPage = .music
+            setExpanded(false)
+            orderOut(nil)
+            onPresentationChange?()
+        } else {
+            showIfAllowed()
+        }
+    }
+
+    func setExpanded(_ expanded: Bool) {
+        if expanded && (hiddenForFullScreen || sessionProtected || !userVisible) { return }
+        if !expanded && isKeyWindow { resignKey() }
         guard state.expanded != expanded else { return }
-        state.expanded = expanded
-        ignoresMouseEvents = !expanded
-        applyFrame(expanded: expanded, animated: true)
+        let source = frame
+        let target = targetFrame(expanded: expanded)
+        let update = {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                self.state.expanded = expanded
+                self.state.expandProgress = expanded ? 1 : 0
+                // Each snapshot uses its own endpoint coordinates.
+                self.state.barLeadingInset = 0
+            }
+        }
+        if isVisible, let windowTransition, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            windowTransition.animate(in: self, canvas: targetFrame(expanded: true).union(source),
+                                     source: source, target: target, update: update) { [weak self] in
+                self?.applyFrame(expanded: expanded, animated: false)
+            }
+            onPresentationChange?()
+        } else {
+            update()
+            applyFrame(expanded: expanded, animated: false)
+        }
     }
 
-    override var canBecomeKey: Bool { false }
+    func toggleExpanded() {
+        if state.expanded { setExpanded(false) }
+        else { openPage(state.selectedPage) }
+    }
+
+    override var canBecomeKey: Bool { state.expanded }
     override var canBecomeMain: Bool { false }
+}
+
+// Helper so AppKit code can drive a simple animation flag without importing
+// SwiftUI animation APIs incorrectly from a non-View context.
+@MainActor
+private func withAnimation(_ animation: Animation, _ body: () -> Void) {
+    SwiftUI.withAnimation(animation, body)
 }

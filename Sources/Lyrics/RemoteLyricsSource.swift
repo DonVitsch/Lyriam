@@ -31,6 +31,49 @@ struct RemoteLyricsSource {
         return nil
     }
 
+    /// Resolves a cover image for a track.
+    ///
+    /// Needed because the system "Now Playing" payload carries no image data on
+    /// current macOS, so players like NetEase Cloud Music would otherwise show
+    /// a blank square.
+    func fetchArtworkURL(title: String, artist: String) async -> URL? {
+        let candidates = await searchSongs(title: title, artist: artist)
+        guard !candidates.isEmpty else { return nil }
+        let target = artist.lowercased()
+        let ordered = candidates.sorted { a, b in
+            let am = !target.isEmpty && (a.artist.lowercased().contains(target) || target.contains(a.artist.lowercased()))
+            let bm = !target.isEmpty && (b.artist.lowercased().contains(target) || target.contains(b.artist.lowercased()))
+            return am && !bm
+        }
+        for song in ordered.prefix(4) {
+            if let url = await fetchCoverURL(songID: song.id) { return url }
+        }
+        return nil
+    }
+
+    private func fetchCoverURL(songID: Int) async -> URL? {
+        // Note the trailing slash and the explicit `id=` — without them this
+        // endpoint answers with an empty body (verified on 2026-10).
+        guard let url = URL(string: "https://music.163.com/api/song/detail/?id=\(songID)&ids=%5B\(songID)%5D") else {
+            return nil
+        }
+        do {
+            let (data, _) = try await session.data(for: makeRequest(url))
+            let result = try JSONDecoder().decode(DetailResponse.self, from: data)
+            guard let album = result.songs?.first?.album else { return nil }
+            let pic = album.picUrl ?? album.blurPicUrl ?? ""
+            guard !pic.isEmpty else { return nil }
+            guard var components = URLComponents(string: pic) else { return nil }
+            // NetEase's API commonly returns plain HTTP artwork URLs. App
+            // Transport Security blocks those by default, so use the same CDN
+            // URL over HTTPS before handing it to URLSession.
+            if components.scheme?.lowercased() == "http" { components.scheme = "https" }
+            return components.url
+        } catch {
+            return nil
+        }
+    }
+
     /// NetEase blocks requests without browser-like headers, which is why
     /// popular songs were coming back empty.
     private func makeRequest(_ url: URL) -> URLRequest {
@@ -88,5 +131,16 @@ struct RemoteLyricsSource {
     private struct LyricResponse: Decodable {
         struct LRC: Decodable { let lyric: String? }
         let lrc: LRC?
+    }
+
+    private struct DetailResponse: Decodable {
+        struct Song: Decodable {
+            struct Album: Decodable {
+                let picUrl: String?
+                let blurPicUrl: String?
+            }
+            let album: Album?
+        }
+        let songs: [Song]?
     }
 }

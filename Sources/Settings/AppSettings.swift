@@ -2,9 +2,6 @@ import Foundation
 import SwiftUI
 import AppKit
 
-/// Placement modes for the collapsed island. All modes wrap the notch (the
-/// camera gap stays aligned to the physical notch); they differ in how far the
-/// bar extends to the right of the camera.
 enum IslandMode: String, CaseIterable, Identifiable {
     case leftSafe       // right cap stops just past the camera — never covers right-side apps (default)
     case notchCentered  // symmetric wings centered on the camera — may cover right-side menu items
@@ -19,15 +16,82 @@ enum IslandMode: String, CaseIterable, Identifiable {
     }
 }
 
-/// How the lyric text is colored.
-enum LyricColorMode: String, CaseIterable, Identifiable {
-    case followArtwork  // derived from the album-art theme color
-    case custom         // a fixed user-chosen color
+
+/// How the expanded card colors itself.
+enum ColorStyle: String, CaseIterable, Identifiable {
+    case artwork
+    case gradient
+    case color
+    case mono
+
     var id: String { rawValue }
+
     var displayName: String {
         switch self {
-        case .followArtwork: return "跟随封面主题色"
-        case .custom:        return "自定义颜色"
+        case .artwork:  return "跟随封面"
+        case .gradient: return "渐变"
+        case .color:    return "自定义"
+        case .mono:     return "单色"
+        }
+    }
+}
+
+/// Which player Lyriam follows for now-playing information.
+///
+/// Reading is source-agnostic (the system "Now Playing" session plus a
+/// CoreAudio check on which process is actually emitting audio); this enum
+/// only decides which bundle identifiers are accepted.
+enum MediaSourceKind: String, CaseIterable, Identifiable {
+    case auto
+    case netease
+    case appleMusic
+    case spotify
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .auto:       return "自动"
+        case .netease:    return "网易云音乐"
+        case .appleMusic: return "Apple Music"
+        case .spotify:    return "Spotify"
+        }
+    }
+
+    /// Bundle identifiers this source accepts.
+    var acceptedBundleIDs: [String] {
+        switch self {
+        case .auto:       return MediaSourceKind.allKnownBundleIDs
+        case .netease:    return [MediaSourceKind.neteaseBundleID]
+        case .appleMusic: return [MediaSourceKind.appleMusicBundleID]
+        case .spotify:    return [MediaSourceKind.spotifyBundleID]
+        }
+    }
+
+    /// Prefers AppleScript for Apple Music (its private script dictionary is
+    /// the most accurate path) and system media keys for everything else.
+    var prefersAppleScriptControl: Bool {
+        self == .appleMusic
+    }
+
+    static let neteaseBundleID = "com.netease.163music"
+    static let appleMusicBundleID = "com.apple.Music"
+    static let spotifyBundleID = "com.spotify.client"
+
+    static let allKnownBundleIDs = [neteaseBundleID, appleMusicBundleID, spotifyBundleID]
+}
+
+/// Idle activity shown when nothing transient is active.
+enum IdleActivity: String, CaseIterable, Identifiable {
+    case nowPlaying
+    case none
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .nowPlaying: return "正在播放"
+        case .none:       return "不显示"
         }
     }
 }
@@ -40,27 +104,125 @@ final class AppSettings: ObservableObject {
     @Published var islandMode: IslandMode {
         didSet { defaults.set(islandMode.rawValue, forKey: "islandMode") }
     }
-    /// "System" means the default system font; otherwise an installed family name.
+
+    // MARK: - General / Behaviour
+
+    @Published var expandOnHover: Bool {
+        didSet { defaults.set(expandOnHover, forKey: "expandOnHover") }
+    }
+    @Published var hoverDuration: Double {
+        didSet { defaults.set(hoverDuration, forKey: "hoverDuration") }
+    }
+    @Published var contrastOutline: Bool {
+        didSet { defaults.set(contrastOutline, forKey: "contrastOutline") }
+    }
+    @Published var progressiveBlur: Bool {
+        didSet { defaults.set(progressiveBlur, forKey: "progressiveBlur") }
+    }
+    @Published var hideInFullscreen: Bool {
+        didSet { defaults.set(hideInFullscreen, forKey: "hideInFullscreen") }
+    }
+    @Published var hideMenuBarIcon: Bool {
+        didSet { defaults.set(hideMenuBarIcon, forKey: "hideMenuBarIcon") }
+    }
+    @Published var showVolumeHUD: Bool {
+        didSet { defaults.set(showVolumeHUD, forKey: "showVolumeHUD") }
+    }
+    @Published var showBrightnessHUD: Bool {
+        didSet { defaults.set(showBrightnessHUD, forKey: "showBrightnessHUD") }
+    }
+    @Published var replaceSystemHUD: Bool {
+        didSet { defaults.set(replaceSystemHUD, forKey: "replaceSystemHUD") }
+    }
+    @Published var showHeadphoneActivity: Bool {
+        didSet { defaults.set(showHeadphoneActivity, forKey: "showHeadphoneActivity") }
+    }
+    @Published var showChargingActivity: Bool {
+        didSet { defaults.set(showChargingActivity, forKey: "showChargingActivity") }
+    }
+    @Published var clipboardEnabled: Bool {
+        didSet { defaults.set(clipboardEnabled, forKey: "clipboardEnabled") }
+    }
+    @Published var fileShelfEnabled: Bool {
+        didSet { defaults.set(fileShelfEnabled, forKey: "fileShelfEnabled") }
+    }
+    @Published var showCapsLockActivity: Bool {
+        didSet { defaults.set(showCapsLockActivity, forKey: "showCapsLockActivity") }
+    }
+    @Published var showNetworkActivity: Bool {
+        didSet { defaults.set(showNetworkActivity, forKey: "showNetworkActivity") }
+    }
+    @Published var showNetworkDashboard: Bool {
+        didSet { defaults.set(showNetworkDashboard, forKey: "showNetworkDashboard") }
+    }
+    @Published var showLockScreenMusic: Bool {
+        didSet { defaults.set(showLockScreenMusic, forKey: "showLockScreenMusic") }
+    }
+    @Published var forceSimulatedNotch: Bool {
+        didSet { defaults.set(forceSimulatedNotch, forKey: "forceSimulatedNotch") }
+    }
+    @Published var idleActivity: IdleActivity {
+        didSet { defaults.set(idleActivity.rawValue, forKey: "idleActivity") }
+    }
+
+    /// Which player Lyriam reads now-playing information from.
+    @Published var mediaSource: MediaSourceKind {
+        didSet { defaults.set(mediaSource.rawValue, forKey: "mediaSource") }
+    }
+
+    // MARK: - Gestures
+
+    @Published var swipeToSkip: Bool {
+        didSet { defaults.set(swipeToSkip, forKey: "swipeToSkip") }
+    }
+    @Published var swipeToToggle: Bool {
+        didSet { defaults.set(swipeToToggle, forKey: "swipeToToggle") }
+    }
+
+    // MARK: - Now Playing
+
+    @Published var colorStyle: ColorStyle {
+        didSet { defaults.set(colorStyle.rawValue, forKey: "colorStyle") }
+    }
+    @Published var useLiveWaveform: Bool {
+        didSet { defaults.set(useLiveWaveform, forKey: "useLiveWaveform") }
+    }
+    @Published var disableCompactWaveform: Bool {
+        didSet { defaults.set(disableCompactWaveform, forKey: "disableCompactWaveform") }
+    }
+    @Published var disableArtworkFlip: Bool {
+        didSet { defaults.set(disableArtworkFlip, forKey: "disableArtworkFlip") }
+    }
+    @Published var showLyricsInExpanded: Bool {
+        didSet { defaults.set(showLyricsInExpanded, forKey: "showLyricsInExpanded") }
+    }
+    @Published var showLyricsOnIsland: Bool {
+        didSet { defaults.set(showLyricsOnIsland, forKey: "showLyricsOnIsland") }
+    }
+
+    // MARK: - Lyrics appearance (Lyriam extras)
+
     @Published var fontName: String {
         didSet { defaults.set(fontName, forKey: "fontName") }
     }
-    /// Base lyric font size used in the collapsed bar (CJK uses this directly,
-    /// Latin scales down a little).
     @Published var lyricFontSize: Double {
         didSet { defaults.set(lyricFontSize, forKey: "lyricFontSize") }
     }
-    /// Marquee scroll speed (points per second) for over-long lyric lines.
     @Published var marqueeSpeed: Double {
         didSet { defaults.set(marqueeSpeed, forKey: "marqueeSpeed") }
-    }
-    @Published var lyricColorMode: LyricColorMode {
-        didSet { defaults.set(lyricColorMode.rawValue, forKey: "lyricColorMode") }
     }
     @Published var customColorHex: String {
         didSet { defaults.set(customColorHex, forKey: "customColorHex") }
     }
 
-    /// The fixed user color (backed by `customColorHex`).
+    /// Notch width/height fine-tuning (Alcove Tuning).
+    @Published var notchWidthBias: Double {
+        didSet { defaults.set(notchWidthBias, forKey: "notchWidthBias") }
+    }
+    @Published var notchHeightBias: Double {
+        didSet { defaults.set(notchHeightBias, forKey: "notchHeightBias") }
+    }
+
     var customColor: Color {
         get { Color(hex: customColorHex) ?? .white }
         set { customColorHex = newValue.toHex() }
@@ -68,30 +230,62 @@ final class AppSettings: ObservableObject {
 
     private init() {
         islandMode = IslandMode(rawValue: defaults.string(forKey: "islandMode") ?? "") ?? .leftSafe
+        expandOnHover = defaults.object(forKey: "expandOnHover") as? Bool ?? true
+        let hover = defaults.double(forKey: "hoverDuration")
+        hoverDuration = hover > 0 ? hover : 0.25
+        contrastOutline = defaults.object(forKey: "contrastOutline") as? Bool ?? true
+        progressiveBlur = defaults.object(forKey: "progressiveBlur") as? Bool ?? true
+        hideInFullscreen = defaults.object(forKey: "hideInFullscreen") as? Bool ?? true
+        hideMenuBarIcon = defaults.object(forKey: "hideMenuBarIcon") as? Bool ?? false
+        showVolumeHUD = defaults.object(forKey: "showVolumeHUD") as? Bool ?? true
+        showBrightnessHUD = defaults.object(forKey: "showBrightnessHUD") as? Bool ?? true
+        replaceSystemHUD = defaults.object(forKey: "replaceSystemHUD") as? Bool ?? true
+        showHeadphoneActivity = defaults.object(forKey: "showHeadphoneActivity") as? Bool ?? true
+        showChargingActivity = defaults.object(forKey: "showChargingActivity") as? Bool ?? true
+        clipboardEnabled = defaults.object(forKey: "clipboardEnabled") as? Bool ?? true
+        fileShelfEnabled = defaults.object(forKey: "fileShelfEnabled") as? Bool ?? true
+        showCapsLockActivity = defaults.object(forKey: "showCapsLockActivity") as? Bool ?? true
+        showNetworkActivity = defaults.object(forKey: "showNetworkActivity") as? Bool ?? true
+        showNetworkDashboard = defaults.object(forKey: "showNetworkDashboard") as? Bool ?? true
+        showLockScreenMusic = defaults.object(forKey: "showLockScreenMusic") as? Bool ?? true
+        forceSimulatedNotch = defaults.object(forKey: "forceSimulatedNotch") as? Bool ?? false
+        idleActivity = IdleActivity(rawValue: defaults.string(forKey: "idleActivity") ?? "") ?? .nowPlaying
+        mediaSource = MediaSourceKind(rawValue: defaults.string(forKey: "mediaSource") ?? "") ?? .auto
+
+        swipeToSkip = defaults.object(forKey: "swipeToSkip") as? Bool ?? true
+        swipeToToggle = defaults.object(forKey: "swipeToToggle") as? Bool ?? true
+
+        colorStyle = ColorStyle(rawValue: defaults.string(forKey: "colorStyle") ?? "") ?? .artwork
+        useLiveWaveform = defaults.object(forKey: "useLiveWaveform") as? Bool ?? true
+        disableCompactWaveform = defaults.object(forKey: "disableCompactWaveform") as? Bool ?? false
+        disableArtworkFlip = defaults.object(forKey: "disableArtworkFlip") as? Bool ?? false
+        showLyricsInExpanded = defaults.object(forKey: "showLyricsInExpanded") as? Bool ?? true
+        showLyricsOnIsland = defaults.object(forKey: "showLyricsOnIsland") as? Bool ?? true
+
         fontName = defaults.string(forKey: "fontName") ?? "System"
         let size = defaults.double(forKey: "lyricFontSize")
-        lyricFontSize = size > 0 ? size : 20
+        lyricFontSize = size > 0 ? size : 15
         let speed = defaults.double(forKey: "marqueeSpeed")
         marqueeSpeed = speed > 0 ? speed : 30
-        lyricColorMode = LyricColorMode(rawValue: defaults.string(forKey: "lyricColorMode") ?? "") ?? .custom
         customColorHex = defaults.string(forKey: "customColorHex") ?? "#FFFFFF"
+        notchWidthBias = defaults.double(forKey: "notchWidthBias")
+        notchHeightBias = defaults.double(forKey: "notchHeightBias")
     }
 
-    /// Resolve the lyric text color given the current album-art theme color.
     func lyricColor(artworkColor: Color?) -> Color {
-        switch lyricColorMode {
-        case .custom:       return customColor
-        case .followArtwork: return artworkColor?.readableOnDark() ?? .white
+        switch colorStyle {
+        case .mono:     return .white
+        case .color:    return customColor
+        case .gradient, .artwork:
+            return artworkColor?.readableOnDark() ?? .white
         }
     }
 
-    /// Resolve the chosen font family into a SwiftUI Font at the given size.
     func font(size: CGFloat, weight: Font.Weight = .semibold) -> Font {
         if fontName == "System" { return .system(size: size, weight: weight) }
         return .custom(fontName, size: size)
     }
 
-    /// Installed font families, with "System" first, for the picker.
     static var availableFonts: [String] {
         ["System"] + NSFontManager.shared.availableFontFamilies
     }
